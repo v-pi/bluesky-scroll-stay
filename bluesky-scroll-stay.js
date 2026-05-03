@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Bluesky Load New & Stay (Absolute Y Anchor)
+// @name         Bluesky Load New & Stay (Deep Engine Hook)
 // @namespace    http://tampermonkey.net/
-// @version      6.0
-// @description  Bouton ⚓. Fige la vue en traquant les coordonnées absolues des posts.
+// @version      7.0
+// @description  Monkey-patch le moteur JavaScript pour bloquer le scrollTo 0 de React Native.
 // @author       Toi + IA
 // @match        https://bsky.app/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bsky.app
@@ -12,7 +12,53 @@
 (function() {
     'use strict';
 
-    const POST_SELECTOR = '[data-testid^="feedItem-"], [data-testid^="postThreadItem-"]';
+    // Notre variable magique pour activer/désactiver le bouclier
+    window.__bskyStayActive = false;
+
+    // =========================================================================
+    // LE MONKEY PATCH DE L'EXTRÊME
+    // =========================================================================
+
+    // 1. On sauvegarde le vrai "setter" matériel de la barre de défilement
+    const origScrollTop = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+    
+    // 2. On le pirate pour intercepter les manipulations directes (element.scrollTop = 0)
+    Object.defineProperty(Element.prototype, 'scrollTop', {
+        set: function(val) {
+            // Si on charge des posts ET que Bluesky essaie de forcer le retour en haut (val < 100px)
+            if (window.__bskyStayActive && val < 100) {
+                console.log("[Bluesky Stay] 🛑 Blocage profond de React (element.scrollTop = " + val + ")");
+                return; // On annule l'opération purement et simplement
+            }
+            // Sinon, on laisse l'opération se faire
+            origScrollTop.set.call(this, val);
+        },
+        get: function() {
+            return origScrollTop.get.call(this);
+        }
+    });
+
+    // 3. On pirate aussi les fonctions classiques au cas où
+    const blockScrollFn = function(origFn, name) {
+        return function() {
+            if (window.__bskyStayActive) {
+                let top = arguments[0] && typeof arguments[0] === 'object' ? arguments[0].top : arguments[1];
+                if (top !== undefined && top < 100) {
+                    console.log(`[Bluesky Stay] 🛑 Blocage de la fonction ${name}(${top})`);
+                    return;
+                }
+            }
+            return origFn.apply(this, arguments);
+        };
+    };
+
+    window.scrollTo = blockScrollFn(window.scrollTo, 'window.scrollTo');
+    window.scroll = blockScrollFn(window.scroll, 'window.scroll');
+    Element.prototype.scrollTo = blockScrollFn(Element.prototype.scrollTo, 'Element.scrollTo');
+
+    // =========================================================================
+    // LOGIQUE DE L'INTERFACE ET DU BOUTON
+    // =========================================================================
 
     function getScrollContainer(element) {
         let parent = element.parentElement;
@@ -23,13 +69,13 @@
             }
             parent = parent.parentElement;
         }
-        return window;
+        return window; 
     }
 
     function injectStayButton(originalBtn) {
         originalBtn.setAttribute('data-stay-processed', 'true');
         const parent = originalBtn.parentNode;
-
+        
         parent.style.display = 'flex';
         parent.style.flexDirection = 'row';
         parent.style.gap = '10px';
@@ -37,7 +83,7 @@
         const stayBtn = originalBtn.cloneNode(true);
         stayBtn.setAttribute('aria-label', 'Load new and stay');
         stayBtn.removeAttribute('data-stay-processed');
-
+        
         stayBtn.style.backgroundColor = "#208bfe";
         stayBtn.style.borderColor = "#208bfe";
         stayBtn.innerHTML = '<span style="color:white; font-size:18px; line-height:1; display:flex; align-items:center; justify-content:center; width:100%; height:100%;">⚓</span>';
@@ -54,135 +100,40 @@
     function handleLoadAndStay(originalBtn) {
         const scrollContainer = getScrollContainer(originalBtn);
         const isWindow = scrollContainer === window;
+        const targetToObserve = isWindow ? document.body : (scrollContainer.firstElementChild || scrollContainer);
+        
+        // On active le bouclier anti-retour en haut !
+        window.__bskyStayActive = true;
+        console.log("[Bluesky Stay] 🛡️ Bouclier activé.");
 
-        const getScroll = () => isWindow ? (window.scrollY || document.documentElement.scrollTop) : scrollContainer.scrollTop;
-        const getHeight = () => isWindow ? document.documentElement.scrollHeight : scrollContainer.scrollHeight;
+        let lastHeight = isWindow ? document.documentElement.scrollHeight : scrollContainer.scrollHeight;
 
-        let isScriptScrolling = false;
-        const safeSetScroll = (val) => {
-            isScriptScrolling = true;
-            if (isWindow) {
-                window.scrollTo({ top: val, behavior: 'instant' });
-            } else {
-                scrollContainer.scrollTop = val;
+        // Le radar qui va capter l'insertion de nouveaux posts par React
+        const resizeObserver = new ResizeObserver(() => {
+            const currentHeight = isWindow ? document.documentElement.scrollHeight : scrollContainer.scrollHeight;
+            const delta = currentHeight - lastHeight;
+            
+            if (delta > 0) {
+                console.log(`[Bluesky Stay] 📏 React a inséré ${delta}px de contenu. On compense la molette.`);
+                // On utilise le setter direct (en bypassant notre propre sécurité si besoin)
+                const targetObj = isWindow ? document.documentElement : scrollContainer;
+                const currentScroll = origScrollTop.get.call(targetObj);
+                origScrollTop.set.call(targetObj, currentScroll + delta);
+                
+                lastHeight = currentHeight;
             }
-            // Petit délai pour laisser le navigateur peindre la frame
-            setTimeout(() => { isScriptScrolling = false; }, 0);
-        };
-
-        // 1. On capture l'état initial (les 3 posts les plus hauts à l'écran)
-        const posts = Array.from(document.querySelectorAll(POST_SELECTOR));
-        const visiblePosts = posts.filter(p => {
-            const rect = p.getBoundingClientRect();
-            return rect.top >= 40 && rect.top < window.innerHeight;
         });
 
-        const currentScroll = getScroll();
-        let expectedScroll = currentScroll;
-        let lastHeight = getHeight();
+        resizeObserver.observe(targetToObserve);
 
-        // On calcule la coordonnée Absolue Y (Scroll actuel + Position dans l'écran)
-        let anchors = visiblePosts.slice(0, 3).map(post => ({
-            id: post.getAttribute('data-testid'),
-            absoluteY: currentScroll + post.getBoundingClientRect().top
-        }));
-
-        let isActive = true;
-
-        // 2. On bloque les tentatives de Bluesky de nous ramener à 0 brutalement
-        const origWindowScrollTo = window.scrollTo;
-        const origElementScrollTo = Element.prototype.scrollTo;
-
-        const blockScroll = function() {
-            if (!isActive || isScriptScrolling) {
-                if (this === window) origWindowScrollTo.apply(this, arguments);
-                else origElementScrollTo.apply(this, arguments);
-                return;
-            }
-
-            let arg0 = arguments[0];
-            let targetTop = (typeof arg0 === 'object' && arg0 !== null) ? arg0.top : arg0;
-
-            // Si Bluesky essaie de forcer le scroll tout en haut, on l'annule
-            if (targetTop !== undefined && targetTop < expectedScroll - 100) {
-                return;
-            }
-
-            if (this === window) origWindowScrollTo.apply(this, arguments);
-            else origElementScrollTo.apply(this, arguments);
-        };
-
-        window.scrollTo = blockScroll;
-        Element.prototype.scrollTo = blockScroll;
-
-        // 3. On déclenche le vrai chargement
+        // On déclenche le chargement (React va faire son travail et se cogner à notre bouclier)
         originalBtn.click();
 
-        // 4. Boucle de surveillance fluide (60 FPS)
-        function loop() {
-            if (!isActive) return;
-
-            let actualScroll = getScroll();
-            let currentHeight = getHeight();
-            let shiftDelta = 0;
-
-            // Détection si c'est l'utilisateur qui scrolle à la main
-            if (actualScroll !== expectedScroll) {
-                if (Math.abs(actualScroll - expectedScroll) < 200 && currentHeight === lastHeight) {
-                    expectedScroll = actualScroll; // On accepte le scroll manuel
-                } else if (actualScroll < expectedScroll - 100) {
-                    // Fallback si Bluesky a hacké le scroll avec une autre méthode
-                    safeSetScroll(expectedScroll);
-                    actualScroll = expectedScroll;
-                }
-            }
-
-            // On cherche de combien les ancrent ont bougé en absolu
-            let foundAnchor = false;
-            for (let anchor of anchors) {
-                let el = document.querySelector(`[data-testid="${anchor.id}"]`);
-                if (el) {
-                    let currentAbsoluteY = actualScroll + el.getBoundingClientRect().top;
-                    shiftDelta = currentAbsoluteY - anchor.absoluteY;
-
-                    if (Math.abs(shiftDelta) > 1) {
-                        foundAnchor = true;
-                        break;
-                    }
-                }
-            }
-
-            // Fallback si la page s'est tellement agrandie que les posts originaux ont été supprimés
-            if (!foundAnchor && currentHeight > lastHeight) {
-                shiftDelta = currentHeight - lastHeight;
-            }
-
-            // Si le contenu a été physiquement poussé vers le bas
-            if (shiftDelta > 0) {
-                expectedScroll += shiftDelta;
-                safeSetScroll(expectedScroll);
-                actualScroll = expectedScroll;
-
-                // On met à jour nos coordonnées de référence
-                lastHeight = currentHeight;
-                for (let anchor of anchors) {
-                    let el = document.querySelector(`[data-testid="${anchor.id}"]`);
-                    if (el) {
-                        anchor.absoluteY = actualScroll + el.getBoundingClientRect().top;
-                    }
-                }
-            }
-
-            requestAnimationFrame(loop);
-        }
-
-        requestAnimationFrame(loop);
-
-        // 5. Nettoyage après 3 secondes (fin du chargement)
+        // On relâche le bouclier après 3 secondes
         setTimeout(() => {
-            isActive = false;
-            window.scrollTo = origWindowScrollTo;
-            Element.prototype.scrollTo = origElementScrollTo;
+            resizeObserver.disconnect();
+            window.__bskyStayActive = false;
+            console.log("[Bluesky Stay] 🛡️ Bouclier désactivé. Retour à la normale.");
         }, 3000);
     }
 
